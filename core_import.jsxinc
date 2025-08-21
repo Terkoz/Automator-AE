@@ -1,0 +1,383 @@
+﻿// core_import.jsxinc (panel-safe exports + robust JSON I/O)
+
+// --- Property helpers ---
+function getPropSafe(layer, group, propName){
+    try{
+        var g = layer.property(group);
+        return g ? g.property(propName) : null;
+    } catch(e){ return null; }
+}
+
+//
+function getPositionProperty(layer){
+    var p = getPropSafe(layer, "Transform", "Position"); if (p) return p;
+    try {
+        if (layer.property("ADBE Transform Group") && layer.property("ADBE Transform Group").property("ADBE Position"))
+            return layer.property("ADBE Transform Group").property("ADBE Position");
+    } catch(e){}
+    try {
+        for (var j=1;j<=layer.numProperties;j++){
+            var prop = layer.property(j);
+            if (prop.matchName === "ADBE Position") return prop;
+        }
+    } catch(e){}
+    return null;
+}
+function getScaleProperty(layer){ return getPropSafe(layer,"Transform","Scale"); }
+function getOpacityProperty(layer){ return getPropSafe(layer,"Transform","Opacity"); }
+function getAnchorProperty(layer){ return getPropSafe(layer,"Transform","Anchor Point"); }
+function getRotationProperty(layer){
+    var p = getPropSafe(layer,"Transform","Rotation");
+    if (!p) p = getPropSafe(layer,"Transform","Z Rotation");
+    return p;
+}
+
+function isTextLayer(layer){ try { return (layer instanceof TextLayer); } catch(e){ return false; } }
+function isShapeLayer(layer){ try { return (layer.matchName === "ADBE Vector Layer"); } catch(e){ return false; } }
+function isAVLayer(layer){ try { return (layer instanceof AVLayer); } catch(e){ return false; } }
+
+function applyTransformBlock(layer, block){
+    if (!block) return;
+    applyOneProp(getAnchorProperty(layer), block.anchor);
+    applyOneProp(getPositionProperty(layer), block.position);
+    applyOneProp(getScaleProperty(layer), block.scale);
+    applyOneProp(getRotationProperty(layer), block.rotation);
+    applyOneProp(getOpacityProperty(layer), block.opacity);
+}
+// AV Helpers
+function __findFootageByPath(fsName){
+    try {
+        for (var i=1;i<=app.project.numItems;i++){
+            var it = app.project.item(i);
+            if (it instanceof FootageItem){
+                try { if (it.file && it.file.fsName === fsName) return it; } catch(_){}
+            }
+        }
+    } catch(e){}
+    return null;
+}
+function __importFootageIfNeeded(fsName){
+    try {
+        if (!fsName) return null;
+        var existing = __findFootageByPath(fsName);
+        if (existing) return existing;
+        var f = File(fsName);
+        if (!f.exists) return null;
+        var io = new ImportOptions(f);
+        if (!io.canImportAs(ImportAsType.FOOTAGE)) { /* igual sirve sin setear */ }
+        return app.project.importFile(io);
+    } catch(e){
+        return null;
+    }
+}
+
+// --- AV Layers (mejorado) ---
+function serializeAVLayer(layer){
+    var src = null;
+    try {
+        if (layer.source){
+            if (layer.source instanceof FootageItem){
+                var f = null, p = null, isStill = false, name = String(layer.source.name||"");
+                try { f = layer.source.file; } catch(_){}
+                try { p = f ? f.fsName : null; } catch(_){}
+                try { isStill = layer.source.mainSource ? !!layer.source.mainSource.isStill : false; } catch(_){}
+                src = {
+                    type: "Footage",
+                    name: name,
+                    path: p,            // ruta absoluta si está disponible
+                    isStill: isStill
+                };
+            } else if (layer.source instanceof CompItem){
+                src = { type: "CompRef", name: String(layer.source.name||"") };
+            } else if (layer.source instanceof SolidSource){
+                src = { type: "Solid", name: String(layer.source.name||""), color: [0,0,0] };
+            }
+        }
+    } catch(e){ /* no-op */ }
+
+    return {
+        type: "AVLayer", name: layer.name,
+        inPoint: layer.inPoint, outPoint: layer.outPoint, threeD: !!layer.threeDLayer,
+        transform: {
+            anchor: serializeOneProp(getAnchorProperty(layer)),
+            position: serializeOneProp(getPositionProperty(layer)),
+            scale: serializeOneProp(getScaleProperty(layer)),
+            rotation: serializeOneProp(getRotationProperty(layer)),
+            opacity: serializeOneProp(getOpacityProperty(layer))
+        },
+        source: src
+    };
+}
+
+
+function recreateAVLayer(comp, layerData){
+    var src = layerData.source || null;
+    var L = null;
+
+    // 1 Si trae ruta, intenta importar o reutilizar el Footage
+    if (src && src.type === "Footage" && src.path){
+        var fi = __importFootageIfNeeded(src.path);
+        if (fi){
+            L = comp.layers.add(fi);
+        }
+    }
+    // 2 Si no hubo suerte, fallback a sólido (pero mantenemos el nombre)
+    if (!L){
+        L = comp.layers.addSolid([0,0,0], layerData.name||"AV", comp.width, comp.height, comp.pixelAspect||1.0, comp.duration);
+    }
+
+    try { L.name = layerData.name || L.name; } catch(e){}
+    try { L.inPoint = layerData.inPoint; L.outPoint = layerData.outPoint; } catch(e){}
+    try { L.threeDLayer = !!layerData.threeD; } catch(e){}
+
+    // Transforms
+    applyTransformBlock(L, layerData.transform);
+    return L;
+}
+
+
+
+// --- Export selected → prefab (collect) ---
+function serializeSelectedLayersToPrefabCollect(){
+    if (!app.project){ alert("No hay proyecto abierto"); return null; }
+    var comp = app.project.activeItem;
+    if (!comp || !(comp instanceof CompItem)){ alert("Selecciona una composición activa"); return null; }
+    var sel = comp.selectedLayers;
+    if (!sel || sel.length===0){ alert("Selecciona al menos una capa"); return null; }
+
+    var errors = [];
+    var prefab = {
+        prefab_version: "1.0.0", ae_min: "17.0",
+        name: comp.name + "_prefab", created_utc: (new Date()).toUTCString(),
+        layers: []
+    };
+
+    for (var i=0;i<sel.length;i++){
+    var L = sel[i];
+    try {
+        if (isTextLayer(L)) {
+            if ($.global.serializeTextLayer) prefab.layers.push($.global.serializeTextLayer(L));
+            else throw new Error("serializeTextLayer no está disponible (carga text.jsxinc)");
+        }
+        else if (isShapeLayer(L)) {
+            if ($.global.serializeShapeLayer) prefab.layers.push($.global.serializeShapeLayer(L));
+            else throw new Error("serializeShapeLayer no está disponible (carga shapes.jsxinc)");
+        }
+        else if (isAVLayer(L)) {
+            prefab.layers.push(serializeAVLayer(L)); // esta vive aquí
+        }
+        else {
+            errors.push("Capa omitida (tipo no soportado): " + L.name);
+        }
+    } catch(e){
+        errors.push("Error serializando '" + L.name + "': " + e.toString());
+    }
+}
+
+    return { prefab: prefab, errors: errors };
+}
+
+// --- Export with dialog (robusto) ---
+function exportWithDialog(){
+    var bundle = serializeSelectedLayersToPrefabCollect(); if (!bundle) return;
+    var data = bundle.prefab, errs = bundle.errors;
+
+    var dest = null;
+    try { dest = File.saveDialog("Guardar prefab JSON", "JSON:*.json"); }
+    catch(e){ alert("saveDialog falló: " + e.toString()); }
+
+    if (!dest){
+        alert("Export cancelado (no se eligió archivo).\n" + (errs.length ? "Advertencias:\n- " + errs.join("\n- ") : ""));
+        return;
+    }
+    if (!/\.json$/i.test(dest.name)) dest = new File(dest.fsName + ".json");
+
+    try {
+        dest.encoding = "UTF-8"; dest.open("w");
+
+        var __stringify = ($.global.JSON && $.global.JSON.stringify)
+            ? $.global.JSON.stringify
+            : ($.global.JSONX ? $.global.JSONX.stringify : null);
+        if (!__stringify) throw new Error("No hay serializador JSON disponible (JSON.stringify/JSONX)");
+
+        dest.write(__stringify(data));
+        dest.close(); // éxito
+
+        var msg = "Prefab guardado:\n" + dest.fsName;
+        if (errs.length) msg += "\n\nCon advertencias:\n- " + errs.join("\n- ");
+        alert(msg);
+    } catch(e2){
+        try{ dest.close(); }catch(_){}
+        alert("No se pudo guardar el prefab: " + e2.toString());
+    }
+}
+
+// --- Import from JSON (robusto) ---
+function importPrefabFromJSON(){
+    if (!app.project){ alert("No hay proyecto abierto"); return; }
+    var comp = app.project.activeItem;
+    if (!comp || !(comp instanceof CompItem)){ alert("Selecciona una composición activa"); return; }
+
+    var src = File.openDialog("Selecciona un prefab JSON", "JSON:*.json");
+    if (!src) return;
+
+    var txt = "";
+    try { src.encoding="UTF-8"; src.open("r"); txt = src.read(); src.close(); }
+    catch(e){ try{src.close();}catch(_){ } alert("No se pudo leer el archivo: " + e.toString()); return; }
+
+    var __parse = ($.global.JSON && $.global.JSON.parse)
+        ? $.global.JSON.parse
+        : ($.global.JSONX ? $.global.JSONX.parse : null);
+
+    var data;
+    try {
+        if (!__parse) throw new Error("No hay parser JSON disponible (JSON.parse/JSONX)");
+        data = __parse(txt);
+    } catch(e2){
+        alert("JSON inválido: " + e2.toString());
+        return;
+    }
+
+    if (!data || !data.layers){ alert("Prefab sin 'layers'"); return; }
+
+    app.beginUndoGroup("Import Prefab");
+    for (var i=0;i<data.layers.length;i++){
+        var L = data.layers[i];
+        if (L.type === "TextLayer")       recreateTextLayer(comp, L);
+        else if (L.type === "ShapeLayer") recreateShapeLayer(comp, L);
+        else if (L.type === "AVLayer")    recreateAVLayer(comp, L);
+    }
+    app.endUndoGroup();
+    alert("Prefab importado en comp: " + comp.name);
+}
+
+// --- UI animation helpers ---
+var __DUR = 1.5, __DUR_OP = 0.5;
+
+function calculateStartPosition(layer, compWidth, compHeight, direction) {
+    try {
+        var positionProp = getPositionProperty(layer);
+        if (!positionProp) return null;
+        var currentPosition = positionProp.value;
+        var layerRect;
+        try { layerRect = layer.sourceRectAtTime(layer.time, false); }
+        catch (e) { layerRect = {width: 100, height: 100}; }
+
+        if (currentPosition instanceof Array) {
+            if (currentPosition.length === 2) {
+                if (direction === "arriba")    return [currentPosition[0], -layerRect.height];
+                if (direction === "abajo")     return [currentPosition[0], compHeight + layerRect.height];
+                if (direction === "izquierda") return [-layerRect.width, currentPosition[1]];
+                if (direction === "derecha")   return [compWidth + layerRect.width, currentPosition[1]];
+            } else if (currentPosition.length === 3) {
+                if (direction === "arriba")    return [currentPosition[0], -layerRect.height, currentPosition[2]];
+                if (direction === "abajo")     return [currentPosition[0], compHeight + layerRect.height, currentPosition[2]];
+                if (direction === "izquierda") return [-layerRect.width, currentPosition[1], currentPosition[2]];
+                if (direction === "derecha")   return [compWidth + layerRect.width, currentPosition[1], currentPosition[2]];
+            }
+        }
+    } catch (e) {}
+
+    try { // fallback relativo
+        var p = getPositionProperty(layer); if (!p) return null;
+        var c = p.value;
+        if (c instanceof Array) {
+            if (c.length === 2) {
+                if (direction === "arriba")    return [c[0], c[1] - 300];
+                if (direction === "abajo")     return [c[0], c[1] + 300];
+                if (direction === "izquierda") return [c[0] - 300, c[1]];
+                if (direction === "derecha")   return [c[0] + 300, c[1]];
+            } else if (c.length === 3) {
+                if (direction === "arriba")    return [c[0], c[1] - 300, c[2]];
+                if (direction === "abajo")     return [c[0], c[1] + 300, c[2]];
+                if (direction === "izquierda") return [c[0] - 300, c[1], c[2]];
+                if (direction === "derecha")   return [c[0] + 300, c[1], c[2]];
+            }
+        }
+    } catch (e) {}
+    return null;
+}
+function calculateEndPosition(layer, compWidth, compHeight, direction) {
+    return calculateStartPosition(layer, compWidth, compHeight, direction);
+}
+
+function animateLayer(layer, compWidth, compHeight, currentTime, direction) {
+    var positionProp = getPositionProperty(layer);
+    if (!positionProp) { alert("No se encontró 'Position' en: " + layer.name); return; }
+    var currentPosition = positionProp.value;
+    var startPosition   = calculateStartPosition(layer, compWidth, compHeight, direction);
+    if (!startPosition) { alert("No se pudo calcular posición inicial para: " + layer.name); return; }
+    positionProp.setValueAtTime(currentTime, startPosition);
+    positionProp.setValueAtTime(currentTime + __DUR, currentPosition);
+    positionProp.selected = true;
+}
+function animateLayerOut(layer, compWidth, compHeight, currentTime, direction) {
+    var positionProp = getPositionProperty(layer);
+    if (!positionProp) { alert("No se encontró 'Position' en: " + layer.name); return; }
+    var currentPosition = positionProp.value;
+    var endPosition     = calculateEndPosition(layer, compWidth, compHeight, direction);
+    if (!endPosition) { alert("No se pudo calcular posición final para: " + layer.name); return; }
+    positionProp.setValueAtTime(currentTime, currentPosition);
+    positionProp.setValueAtTime(currentTime + __DUR, endPosition);
+    positionProp.selected = true;
+}
+function animateZoomIn(layer,t0){
+    var s=getScaleProperty(layer); if(!s){alert("No 'Scale'");return;}
+    var end=s.value; var dims=(end instanceof Array)?end.length:2;
+    var start=(dims===3)?[0,0,0]:[0,0];
+    s.setValueAtTime(t0,start); s.setValueAtTime(t0+__DUR,end);
+}
+function animateZoomOut(layer,t0){
+    var s=getScaleProperty(layer); if(!s){alert("No 'Scale'");return;}
+    var start=s.value; var dims=(start instanceof Array)?start.length:2;
+    var end=(dims===3)?[0,0,0]:[0,0];
+    s.setValueAtTime(t0,start); s.setValueAtTime(t0+__DUR,end);
+}
+function animateOpacityIn(layer,t0){
+    var o=getOpacityProperty(layer); if(!o){alert("No 'Opacity'");return;}
+    var end=o.value; o.setValueAtTime(t0,0); o.setValueAtTime(t0+__DUR_OP,end);
+}
+function animateOpacityOut(layer,t0){
+    var o=getOpacityProperty(layer); if(!o){alert("No 'Opacity'");return;}
+    var start=o.value; o.setValueAtTime(t0,start); o.setValueAtTime(t0+__DUR_OP,0);
+}
+
+/* --- export to global (panel-safe) --- */
+try {
+    // Animaciones
+    $.global.animateLayer      = animateLayer;
+    $.global.animateLayerOut   = animateLayerOut;
+    $.global.animateZoomIn     = animateZoomIn;
+    $.global.animateZoomOut    = animateZoomOut;
+    $.global.animateOpacityIn  = animateOpacityIn;
+    $.global.animateOpacityOut = animateOpacityOut;
+
+    // Export/Import
+    $.global.exportWithDialog             = exportWithDialog;
+    $.global.importPrefabFromJSON         = importPrefabFromJSON;
+    $.global.serializeSelectedLayersToPrefabCollect = serializeSelectedLayersToPrefabCollect;
+} catch(e) { /* no-op */ }
+/* --- end export --- */
+/* --- export transform helpers to global (panel-safe) --- */
+try {
+    $.global.getPropSafe         = getPropSafe;
+    $.global.getPositionProperty = getPositionProperty;
+    $.global.getScaleProperty    = getScaleProperty;
+    $.global.getOpacityProperty  = getOpacityProperty;
+    $.global.getAnchorProperty   = getAnchorProperty;
+    $.global.getRotationProperty = getRotationProperty;
+
+    $.global.applyTransformBlock = applyTransformBlock;
+
+    // (opcional) detectores de tipo
+    $.global.isTextLayer  = isTextLayer;
+    $.global.isShapeLayer = isShapeLayer;
+    $.global.isAVLayer    = isAVLayer;
+} catch(e){ /* no-op */ }
+/* --- end export --- */
+// export AV helpers
+try {
+    $.global.recreateAVLayer       = recreateAVLayer;
+    $.global.__importFootageIfNeeded = __importFootageIfNeeded;
+    $.global.__findFootageByPath     = __findFootageByPath;
+} catch(e){ /* no-op */ }

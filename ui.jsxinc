@@ -1,0 +1,137 @@
+﻿﻿﻿// ui.jsxinc (Panel-aware + troubleshooting)
+
+$.global.buildAutomatorUI = function (VERSION, hostPanel) {
+    var isPanel = false;
+    try { isPanel = (hostPanel && (hostPanel instanceof Panel)); } catch (_){}
+
+    var win = isPanel ? hostPanel : new Window("palette", "Animation Tools", undefined, {resizable:true});
+    win.orientation = "column";
+    win.alignChildren = "fill";
+    win.spacing = 8;
+    win.margins = 12;
+
+    // ---------- Troubleshooting ----------
+    var __AUTO_DEBUG = true; // pon false para silenciar
+    function __now(){ try{ return (new Date()).toUTCString(); } catch(e){ return ""; } }
+    function __log(msg){
+        try{
+            if (__AUTO_DEBUG) $.writeln("[AutomatorAE] " + msg);
+            var f = File(Folder.userData.fsName + "/AutomatorAE.log");
+            if (f && !f.parent.exists) f.parent.create();
+            f.open("a"); f.writeln(__now()+" "+msg); f.close();
+        }catch(e){}
+    }
+    function __withGuard(btnName, fn){
+        return function(){
+            try{
+                __log("CLICK: " + btnName);
+                var comp = app && app.project ? app.project.activeItem : null;
+                if (!comp || !(comp instanceof CompItem)){ alert("Abre una composición activa."); __log("ABORT "+btnName+": no comp"); return; }
+                var sel = comp.selectedLayers;
+                if (!sel || sel.length===0){ alert("Selecciona al menos una capa."); __log("ABORT "+btnName+": no selection"); return; }
+                fn(comp, sel);
+                try{ statusLbl.text = "  | " + btnName; }catch(_){}
+                __log("OK: " + btnName + " (" + sel.length + " capa/s)");
+            }catch(err){
+                alert("Error en \"" + btnName + "\"\n\n" + err.toString());
+                __log("ERROR "+btnName+": " + err.toString());
+            }
+        };
+    }
+    // Wrapper que solo valida que exista comp activa (sin requerir capas seleccionadas)
+    function __withCompGuard(btnName, handler){
+        return function(){
+            try{
+                __log("CLICK: " + btnName);
+                var comp = app && app.project ? app.project.activeItem : null;
+                if (!comp || !(comp instanceof CompItem)){
+                    alert("Abre una composición activa.");
+                    __log("ABORT " + btnName + ": no comp");
+                    return;
+                }
+                handler(comp);
+                try{ statusLbl.text = "  | " + btnName; }catch(_){}
+                __log("OK: " + btnName + " en comp=" + comp.name);
+            }catch(err){
+                alert("Error en \"" + btnName + "\"\n\n" + err.toString());
+                __log("ERROR " + btnName + ": " + err.toString());
+            }
+        };
+    }
+
+    // -------------------------------------
+
+    // Position IN
+    var panelIn = win.add("panel", undefined, "Position IN");
+    panelIn.alignChildren = "center"; panelIn.margins = 10; panelIn.spacing = 5;
+    var rowIn = panelIn.add("group"); rowIn.spacing = 5;
+    var upBtn    = rowIn.add("button", undefined, "↑"); upBtn.size = [40,40];
+    var leftBtn  = rowIn.add("button", undefined, "←"); leftBtn.size = [40,40];
+    var rightBtn = rowIn.add("button", undefined, "→"); rightBtn.size = [40,40];
+    var downBtn  = rowIn.add("button", undefined, "↓"); downBtn.size = [40,40];
+
+    // Position OUT
+    var panelOut = win.add("panel", undefined, "Position OUT");
+    panelOut.alignChildren = "center"; panelOut.margins = 10; panelOut.spacing = 5;
+    var rowOut = panelOut.add("group"); rowOut.spacing = 5;
+    var upOutBtn    = rowOut.add("button", undefined, "↑"); upOutBtn.size = [40,40];
+    var leftOutBtn  = rowOut.add("button", undefined, "←"); leftOutBtn.size = [40,40];
+    var rightOutBtn = rowOut.add("button", undefined, "→"); rightOutBtn.size = [40,40];
+    var downOutBtn  = rowOut.add("button", undefined, "↓"); downOutBtn.size = [40,40];
+
+    // Zoom + Opacity
+    var bottomGrp = win.add("group"); bottomGrp.orientation = "row"; bottomGrp.spacing = 20;
+    var zoomPanel = bottomGrp.add("panel", undefined, "Zoom"); zoomPanel.margins = 10; zoomPanel.spacing = 5;
+    var zoomInBtn  = zoomPanel.add("button", undefined, "+"); zoomInBtn.size = [40,40];
+    var zoomOutBtn = zoomPanel.add("button", undefined, "-"); zoomOutBtn.size = [40,40];
+
+    var opPanel = bottomGrp.add("panel", undefined, "Opacity"); opPanel.margins = 10; opPanel.spacing = 5;
+    var opacityInBtn  = opPanel.add("button", undefined, "█"); opacityInBtn.size = [40,40];
+    var opacityOutBtn = opPanel.add("button", undefined, "░"); opacityOutBtn.size = [40,40];
+
+    // Prefabs
+    var prefabPanel = win.add("panel", undefined, "Prefabs");
+    prefabPanel.orientation = "row"; prefabPanel.margins = 10; prefabPanel.spacing = 10;
+    var exportBtn = prefabPanel.add("button", undefined, "Export");
+    var importBtn = prefabPanel.add("button", undefined, "Import");
+
+    // Versión + estado
+    var statusGrp = win.add("group"); statusGrp.alignment = "left";
+    var versionLbl = statusGrp.add("statictext", undefined, VERSION);
+    var statusLbl  = statusGrp.add("statictext", undefined, "  | listo");
+
+    // Handlers (después de crear los botones)
+    function _t(comp){ return comp.time; }
+    upBtn.onClick       = __withGuard("Position IN ↑",  function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayer(s[i], c.width, c.height, t, "arriba"); });
+    downBtn.onClick     = __withGuard("Position IN ↓",  function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayer(s[i], c.width, c.height, t, "abajo"); });
+    leftBtn.onClick     = __withGuard("Position IN ←",  function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayer(s[i], c.width, c.height, t, "izquierda"); });
+    rightBtn.onClick    = __withGuard("Position IN →",  function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayer(s[i], c.width, c.height, t, "derecha"); });
+
+    upOutBtn.onClick    = __withGuard("Position OUT ↑", function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayerOut(s[i], c.width, c.height, t, "arriba"); });
+    downOutBtn.onClick  = __withGuard("Position OUT ↓", function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayerOut(s[i], c.width, c.height, t, "abajo"); });
+    leftOutBtn.onClick  = __withGuard("Position OUT ←", function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayerOut(s[i], c.width, c.height, t, "izquierda"); });
+    rightOutBtn.onClick = __withGuard("Position OUT →", function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateLayerOut(s[i], c.width, c.height, t, "derecha"); });
+
+    zoomInBtn.onClick   = __withGuard("Zoom In",        function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateZoomIn(s[i], t); });
+    zoomOutBtn.onClick  = __withGuard("Zoom Out",       function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateZoomOut(s[i], t); });
+
+    opacityInBtn.onClick  = __withGuard("Opacity In",   function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateOpacityIn(s[i], t); });
+    opacityOutBtn.onClick = __withGuard("Opacity Out",  function(c,s){ var t=_t(c); for (var i=0;i<s.length;i++) animateOpacityOut(s[i], t); });
+
+    // Prefabs
+exportBtn.onClick = __withGuard("Export Prefab", function(comp, sel){
+    exportWithDialog();
+});
+importBtn.onClick = __withCompGuard("Import Prefab", function(comp){
+    importPrefabFromJSON(); // no requiere selección
+});
+    // Layout & resize
+    try {
+        win.layout.layout(true);
+        win.onResizing = win.onResize = function(){ this.layout.resize(); };
+        win.minimumSize = [280, 260];
+    } catch(e){}
+
+    if (!isPanel) { win.center(); win.show(); }
+    return win;
+};

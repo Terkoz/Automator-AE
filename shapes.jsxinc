@@ -1,0 +1,432 @@
+﻿// shapes.jsxinc
+// Shape export/import + vector transform + stroke/fill + g-fill (best-effort)
+// --- bridge to global (panel-safe) ---
+if (typeof serializeOneProp    === "undefined" && $.global.serializeOneProp)    var serializeOneProp    = $.global.serializeOneProp;
+if (typeof applyOneProp        === "undefined" && $.global.applyOneProp)        var applyOneProp        = $.global.applyOneProp;
+
+if (typeof getAnchorProperty   === "undefined" && $.global.getAnchorProperty)   var getAnchorProperty   = $.global.getAnchorProperty;
+if (typeof getPositionProperty === "undefined" && $.global.getPositionProperty) var getPositionProperty = $.global.getPositionProperty;
+if (typeof getScaleProperty    === "undefined" && $.global.getScaleProperty)    var getScaleProperty    = $.global.getScaleProperty;
+if (typeof getRotationProperty === "undefined" && $.global.getRotationProperty) var getRotationProperty = $.global.getRotationProperty;
+if (typeof getOpacityProperty  === "undefined" && $.global.getOpacityProperty)  var getOpacityProperty  = $.global.getOpacityProperty;
+
+if (typeof applyTransformBlock === "undefined" && $.global.applyTransformBlock) var applyTransformBlock = $.global.applyTransformBlock;
+// --- end bridge ---
+
+function shapeToJSON(sh){
+    try{
+        return {
+            vertices: sh.vertices ? sh.vertices.slice(0) : [],
+            inTangents: sh.inTangents ? sh.inTangents.slice(0) : [],
+            outTangents: sh.outTangents ? sh.outTangents.slice(0) : [],
+            closed: !!sh.closed
+        };
+    }catch(e){ return null; }
+}
+function shapeFromJSON(obj){
+    try{
+        var s = new Shape();
+        s.vertices   = obj.vertices || [];
+        s.inTangents = obj.inTangents || [];
+        s.outTangents= obj.outTangents || [];
+        s.closed     = !!obj.closed;
+        return s;
+    }catch(e){ return null; }
+}
+function serializeShapeProp(prop){
+    if (!prop) return null;
+    var out = { isKeyframed: false };
+    try{
+        if (prop.numKeys && prop.numKeys>0){
+            out.isKeyframed = true;
+            out.keys = [];
+            for (var k=1;k<=prop.numKeys;k++){
+                var t = prop.keyTime(k);
+                var v = prop.keyValue(k);
+                out.keys.push([t, shapeToJSON(v)]);
+            }
+        }else{
+            out.value = shapeToJSON(prop.value);
+        }
+    }catch(e){}
+    return out;
+}
+function applyShapeProp(prop, data){
+    if (!prop || !data) return;
+    try{
+        if (data.isKeyframed && data.keys && data.keys.length){
+            for (var i=prop.numKeys; i>=1; i--) prop.removeKey(i);
+            for (var j=0;j<data.keys.length;j++){
+                var kv = data.keys[j];
+                var sv = shapeFromJSON(kv[1]);
+                if (sv) prop.setValueAtTime(kv[0], sv);
+            }
+        }else if (data.value){
+            var s = shapeFromJSON(data.value);
+            if (s) prop.setValue(s);
+        }
+    }catch(e){}
+}
+
+// Probe grad colors via expression (best-effort)
+function exprEsc(s){ return String(s).replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
+function probeGradientColorsViaExpression(layer, vecGroupName, gfillName){
+    var nul=null;
+    try{
+        var comp = layer.containingComp;
+        nul = comp.layers.addNull();
+        nul.enabled = false; nul.shy = true; nul.name = "__grad_probe__";
+        var fx = nul.property("ADBE Effect Parade");
+
+        var base = "thisComp.layer('"+exprEsc(layer.name)+"')" +
+                   ".property('ADBE Root Vectors Group')" +
+                   ".property('"+exprEsc(vecGroupName)+"')" +
+                   ".property('ADBE Vectors Group')" +
+                   ".property('"+exprEsc(gfillName)+"').colors";
+
+        var sLen = fx.addProperty("ADBE Slider Control"); sLen.name="__len__";
+        sLen.property("ADBE Slider Control-0001").expression = "try{("+base+").length}catch(e){0}";
+        var N = Math.round(sLen.property("ADBE Slider Control-0001").value);
+        if (!(N>0 && N<300)){ nul.remove(); return null; }
+
+        var out=[], sliders=[];
+        for (var i=0;i<N;i++){
+            var s = fx.addProperty("ADBE Slider Control"); s.name="__c"+i+"__";
+            s.property("ADBE Slider Control-0001").expression = "try{("+base+")["+i+"]}catch(e){0}";
+            sliders.push(s);
+        }
+        for (var j=0;j<sliders.length;j++){
+            out.push(sliders[j].property("ADBE Slider Control-0001").value);
+        }
+        nul.remove();
+        return out;
+    }catch(e){
+        try{ if (nul) nul.remove(); }catch(_){}
+        return null;
+    }
+}
+
+// Vector Group Transform
+function serializeVectorTransform(vecGroup){
+    var tg = vecGroup ? vecGroup.property("ADBE Vector Transform Group") : null;
+    if (!tg) return null;
+    return {
+        anchor:   serializeOneProp(tg.property("ADBE Vector Anchor")),
+        position: serializeOneProp(tg.property("ADBE Vector Position")),
+        scale:    serializeOneProp(tg.property("ADBE Vector Scale")),
+        rotation: serializeOneProp(tg.property("ADBE Vector Rotation")),
+        opacity:  serializeOneProp(tg.property("ADBE Vector Group Opacity"))
+    };
+}
+function applyVectorTransform(vecGroup, data){
+    if (!vecGroup || !data) return;
+    var tg = vecGroup.property("ADBE Vector Transform Group");
+    if (!tg) tg = vecGroup.addProperty("ADBE Vector Transform Group");
+    applyOneProp(tg.property("ADBE Vector Anchor"),   data.anchor);
+    applyOneProp(tg.property("ADBE Vector Position"), data.position);
+    applyOneProp(tg.property("ADBE Vector Scale"),    data.scale);
+    applyOneProp(tg.property("ADBE Vector Rotation"), data.rotation);
+    applyOneProp(tg.property("ADBE Vector Group Opacity"), data.opacity);
+}
+
+// Ensure helpers
+function vectorsContainer(group){
+    var v = group.property("ADBE Vectors Group");
+    return v ? v : group;
+}
+function ensureGroup(root, name){ var grp = root.addProperty("ADBE Vector Group"); grp.name = name || "Group"; return grp; }
+function ensureRect(group){ var vg=vectorsContainer(group); var rect=vg.property("ADBE Vector Shape - Rect"); if(!rect) rect=vg.addProperty("ADBE Vector Shape - Rect"); return rect; }
+function ensureEllipse(group){ var vg=vectorsContainer(group); var el=vg.property("ADBE Vector Shape - Ellipse"); if(!el) el=vg.addProperty("ADBE Vector Shape - Ellipse"); return el; }
+function ensureStar(group){ var vg=vectorsContainer(group); var st=vg.property("ADBE Vector Shape - Star"); if(!st) st=vg.addProperty("ADBE Vector Shape - Star"); return st; }
+function ensurePathGroup(group){ var vg=vectorsContainer(group); var pg=vg.property("ADBE Vector Shape - Group"); if(!pg) pg=vg.addProperty("ADBE Vector Shape - Group"); return pg; }
+function ensureFill(group){ var vg=vectorsContainer(group); var fill=vg.property("ADBE Vector Graphic - Fill"); if(!fill) fill=vg.addProperty("ADBE Vector Graphic - Fill"); return fill; }
+function ensureStroke(group){ var vg=vectorsContainer(group); var st=vg.property("ADBE Vector Graphic - Stroke"); if(!st) st=vg.addProperty("ADBE Vector Graphic - Stroke"); return st; }
+function ensureGFill(group){ var vg=vectorsContainer(group); var gf=vg.property("ADBE Vector Graphic - G-Fill"); if(!gf) gf=vg.addProperty("ADBE Vector Graphic - G-Fill"); return gf; }
+
+function applyColor(prop, data){
+    if (!prop || !data) return;
+    if (data.isKeyframed){
+        try { prop.setValueAtTime(data.keys[0][0], trimRGB(data.keys[0][1])); } catch(e){}
+    } else if (data.hasOwnProperty("value")){
+        try { prop.setValue(trimRGB(data.value)); } catch(e){}
+    }
+}
+
+// SERIALIZE SHAPE LAYER
+function serializeShapeLayer(layer){
+    var contents = [];
+    try {
+        var root = layer.property("ADBE Root Vectors Group");
+        if (root && root.numProperties){
+            for (var i=1;i<=root.numProperties;i++){
+                var it = root.property(i);
+                if (it.matchName === "ADBE Vector Group"){
+                    var node = { matchName: it.matchName, name: it.name, groupTransform: serializeVectorTransform(it), children: [] };
+                    var vectors = it.property("ADBE Vectors Group") || it;
+                    for (var j=1;j<=vectors.numProperties;j++){
+                        var ch = vectors.property(j);
+                        if (ch.matchName === "ADBE Vector Shape - Rect"){
+                            node.children.push({
+                                matchName: ch.matchName,
+                                props: {
+                                    Size: serializeOneProp(ch.property("ADBE Vector Rect Size")),
+                                    Position: serializeOneProp(ch.property("ADBE Vector Rect Position")),
+                                    Roundness: serializeOneProp(ch.property("ADBE Vector Rect Roundness")),
+                                    Enabled: ch.enabled
+                                }
+                            });
+                        }
+                        else if (ch.matchName === "ADBE Vector Shape - Ellipse"){
+                            node.children.push({
+                                matchName: ch.matchName,
+                                props: {
+                                    Size: serializeOneProp(ch.property("ADBE Vector Ellipse Size")),
+                                    Position: serializeOneProp(ch.property("ADBE Vector Ellipse Position")),
+                                    Enabled: ch.enabled
+                                }
+                            });
+                        }
+                        else if (ch.matchName === "ADBE Vector Shape - Star"){
+                            var stProps = {
+                                Type: null,
+                                Points: serializeOneProp(ch.property("ADBE Vector Star Points")),
+                                Position: serializeOneProp(ch.property("ADBE Vector Star Position")),
+                                Rotation: serializeOneProp(ch.property("ADBE Vector Star Rotation")),
+                                InnerRadius: serializeOneProp(ch.property("ADBE Vector Star Inner Radius")),
+                                OuterRadius: serializeOneProp(ch.property("ADBE Vector Star Outer Radius")),
+                                InnerRoundness: serializeOneProp(ch.property("ADBE Vector Star Inner Roundness")),
+                                OuterRoundness: serializeOneProp(ch.property("ADBE Vector Star Outer Roundness")),
+                                Enabled: ch.enabled
+                            };
+                            try { stProps.Type = ch.property("ADBE Vector Star Type").value; } catch(e){}
+                            node.children.push({ matchName: ch.matchName, props: stProps });
+                        }
+                        else if (ch.matchName === "ADBE Vector Shape - Group"){
+                            node.children.push({
+                                matchName: ch.matchName,
+                                props: {
+                                    Shape: serializeShapeProp(ch.property("ADBE Vector Shape")),
+                                    Enabled: ch.enabled
+                                }
+                            });
+                        }
+                        else if (ch.matchName === "ADBE Vector Graphic - Fill"){
+                            node.children.push({
+                                matchName: ch.matchName,
+                                props: {
+                                    Color: serializeOneProp(ch.property("ADBE Vector Fill Color")),
+                                    Opacity: serializeOneProp(ch.property("ADBE Vector Fill Opacity")),
+                                    Enabled: ch.enabled
+                                }
+                            });
+                        }
+                        else if (ch.matchName === "ADBE Vector Graphic - Stroke"){
+                            var strokeNode = {
+                                matchName: ch.matchName,
+                                props: {
+                                    Color: serializeOneProp(ch.property("ADBE Vector Stroke Color")),
+                                    Opacity: serializeOneProp(ch.property("ADBE Vector Stroke Opacity")),
+                                    Width: serializeOneProp(ch.property("ADBE Vector Stroke Width")),
+                                    LineCap: null, LineJoin: null, MiterLimit: null,
+                                    Enabled: ch.enabled
+                                }
+                            };
+                            try { strokeNode.props.LineCap   = ch.property("ADBE Vector Stroke Line Cap").value; } catch(e){}
+                            try { strokeNode.props.LineJoin  = ch.property("ADBE Vector Stroke Line Join").value; } catch(e){}
+                            try { strokeNode.props.MiterLimit= ch.property("ADBE Vector Stroke Miter Limit").value; } catch(e){}
+                            try {
+                                var dashes = ch.property("ADBE Vector Stroke Dashes");
+                                if (dashes && dashes.numProperties && dashes.numProperties > 0){
+                                    var list=[];
+                                    for (var di=1; di<=dashes.numProperties; di++){
+                                        var dprop = dashes.property(di);
+                                        list.push({ name: dprop.matchName, value: dprop.value });
+                                    }
+                                    if (list.length) strokeNode.props.Dashes = list;
+                                }
+                            } catch(e){}
+                            node.children.push(strokeNode);
+                        }
+                        else if (ch.matchName === "ADBE Vector Graphic - G-Fill"){
+                            var g = {
+                                matchName: ch.matchName,
+                                props: { Type: null, Start: null, End: null, ColorsV: null, ColorsKF: null, Enabled: ch.enabled }
+                            };
+                            try { g.props.Type = ch.property("ADBE Vector Grad Type").value; } catch(e){}
+                            try { g.props.Start = serializeOneProp(ch.property("ADBE Vector Grad Start Pt")); } catch(e){}
+                            try { g.props.End   = serializeOneProp(ch.property("ADBE Vector Grad End Pt")); } catch(e){}
+                            try {
+                                var cols = ch.property("ADBE Vector Grad Colors");
+                                if (cols){
+                                    var kf = null, vv = null;
+                                    try {
+                                        if (cols.numKeys && cols.numKeys > 0){
+                                            kf = [];
+                                            for (var ck=1; ck<=cols.numKeys; ck++){
+                                                kf.push({ t: cols.keyTime(ck), v: cols.keyValue(ck) });
+                                            }
+                                        }
+                                    } catch(_){}
+                                    if (!kf){
+                                        try { vv = cols.value; } catch(__){ vv = null; }
+                                        if (!vv || !vv.length){
+                                            try { vv = cols.valueAtTime(layer.containingComp.time, false); } catch(__2){ vv = null; }
+                                        }
+                                        if ((!vv || !vv.length)){
+                                            vv = probeGradientColorsViaExpression(layer, it.name, ch.name);
+                                        }
+                                    }
+                                    if (kf && kf.length) g.props.ColorsKF = kf;
+                                    else if (vv && vv.length) g.props.ColorsV = vv;
+                                }
+                            } catch(e){}
+                            node.children.push(g);
+                        }
+                    }
+                    contents.push(node);
+                }
+            }
+        }
+    } catch(e){}
+    return {
+        type: "ShapeLayer", name: layer.name,
+        inPoint: layer.inPoint, outPoint: layer.outPoint, threeD: !!layer.threeDLayer,
+        transform: {
+            anchor: serializeOneProp(getAnchorProperty(layer)),
+            position: serializeOneProp(getPositionProperty(layer)),
+            scale: serializeOneProp(getScaleProperty(layer)),
+            rotation: serializeOneProp(getRotationProperty(layer)),
+            opacity: serializeOneProp(getOpacityProperty(layer))
+        },
+        contents: contents
+    };
+}
+
+function recreateShapeLayer(comp, layerData){
+    var sh = comp.layers.addShape();
+    sh.name = layerData.name || "Shape";
+    try { sh.inPoint = layerData.inPoint; sh.outPoint = layerData.outPoint; } catch(e){}
+    try { sh.threeDLayer = !!layerData.threeD; } catch(e){}
+
+    var root = sh.property("ADBE Root Vectors Group");
+    try {
+        var items = layerData.contents||[];
+        for (var i=0;i<items.length;i++){
+            var it = items[i];
+            if (it.matchName === "ADBE Vector Group"){
+                var grp = ensureGroup(root, it.name || ("Group_"+i));
+                // aplicar Transform del grupo primero
+                applyVectorTransform(grp, it.groupTransform);
+
+                var kids = it.children||[];
+                for (var j=0;j<kids.length;j++){
+                    var ch = kids[j];
+
+                    if (ch.matchName === "ADBE Vector Shape - Rect"){
+                        var rect = ensureRect(grp);
+                        try { rect.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        applyOneProp(rect.property("ADBE Vector Rect Position"), ch.props && ch.props.Position);
+                        applyOneProp(rect.property("ADBE Vector Rect Size"),     ch.props && ch.props.Size);
+                        applyOneProp(rect.property("ADBE Vector Rect Roundness"),ch.props && ch.props.Roundness);
+                    }
+                    else if (ch.matchName === "ADBE Vector Shape - Ellipse"){
+                        var el = ensureEllipse(grp);
+                        try { el.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        applyOneProp(el.property("ADBE Vector Ellipse Position"), ch.props && ch.props.Position);
+                        applyOneProp(el.property("ADBE Vector Ellipse Size"),     ch.props && ch.props.Size);
+                    }
+                    else if (ch.matchName === "ADBE Vector Shape - Star"){
+                        var star = ensureStar(grp);
+                        try { star.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        try { if (typeof ch.props.Type!=="undefined" && ch.props.Type!==null) star.property("ADBE Vector Star Type").setValue(ch.props.Type); } catch(_){}
+                        applyOneProp(star.property("ADBE Vector Star Points"),          ch.props && ch.props.Points);
+                        applyOneProp(star.property("ADBE Vector Star Position"),         ch.props && ch.props.Position);
+                        applyOneProp(star.property("ADBE Vector Star Rotation"),         ch.props && ch.props.Rotation);
+                        applyOneProp(star.property("ADBE Vector Star Inner Radius"),     ch.props && ch.props.InnerRadius);
+                        applyOneProp(star.property("ADBE Vector Star Outer Radius"),     ch.props && ch.props.OuterRadius);
+                        applyOneProp(star.property("ADBE Vector Star Inner Roundness"),  ch.props && ch.props.InnerRoundness);
+                        applyOneProp(star.property("ADBE Vector Star Outer Roundness"),  ch.props && ch.props.OuterRoundness);
+                    }
+                    else if (ch.matchName === "ADBE Vector Shape - Group"){
+                        var pg = ensurePathGroup(grp);
+                        try { pg.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        applyShapeProp(pg.property("ADBE Vector Shape"), ch.props && ch.props.Shape);
+                    }
+                    else if (ch.matchName === "ADBE Vector Graphic - Fill"){
+                        var fill = ensureFill(grp);
+                        try { fill.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        applyColor(   fill.property("ADBE Vector Fill Color"),   ch.props && ch.props.Color);
+                        applyOneProp( fill.property("ADBE Vector Fill Opacity"), ch.props && ch.props.Opacity);
+                    }
+                    else if (ch.matchName === "ADBE Vector Graphic - Stroke"){
+                        var st = ensureStroke(grp);
+                        try { st.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        applyColor(   st.property("ADBE Vector Stroke Color"),   ch.props && ch.props.Color);
+                        applyOneProp( st.property("ADBE Vector Stroke Opacity"), ch.props && ch.props.Opacity);
+                        applyOneProp( st.property("ADBE Vector Stroke Width"),   ch.props && ch.props.Width);
+                        try { if (ch.props && ch.props.LineCap   !== null) st.property("ADBE Vector Stroke Line Cap").setValue(ch.props.LineCap); } catch(_){}
+                        try { if (ch.props && ch.props.LineJoin  !== null) st.property("ADBE Vector Stroke Line Join").setValue(ch.props.LineJoin); } catch(_){}
+                        try { if (ch.props && ch.props.MiterLimit!== null) st.property("ADBE Vector Stroke Miter Limit").setValue(ch.props.MiterLimit); } catch(_){}
+                        try {
+                            var dashes = st.property("ADBE Vector Stroke Dashes");
+                            try { for (var rid=dashes.numProperties; rid>=1; rid--) dashes.removeProperty(rid); } catch(__){}
+                            if (ch.props && ch.props.Dashes && ch.props.Dashes.length){
+                                for (var di=0; di<ch.props.Dashes.length; di++){
+                                    var d = ch.props.Dashes[di];
+                                    var base = "ADBE Vector Stroke Dash";
+                                    try {
+                                        var m = d.name.match(/^(ADBE Vector Stroke (Dash|Gap|Offset))/);
+                                        if (m && m[2]) base = "ADBE Vector Stroke " + m[2];
+                                    } catch(__){}
+                                    if (base.indexOf("Dash")>=0) base = "ADBE Vector Stroke Dash";
+                                    else if (base.indexOf("Gap")>=0) base = "ADBE Vector Stroke Gap";
+                                    else if (base.indexOf("Offset")>=0) base = "ADBE Vector Stroke Offset";
+                                    var dp = dashes.addProperty(base);
+                                    dp.setValue(d.value);
+                                }
+                            }
+                        } catch(_){}
+                    }
+                    else if (ch.matchName === "ADBE Vector Graphic - G-Fill"){
+                        var gf = ensureGFill(grp);
+                        try { gf.enabled = (ch.props && typeof ch.props.Enabled!=="undefined") ? ch.props.Enabled : true; } catch(_){}
+                        try { if (ch.props && typeof ch.props.Type !== "undefined" && ch.props.Type !== null) gf.property("ADBE Vector Grad Type").setValue(ch.props.Type); } catch(_){}
+                        applyOneProp(gf.property("ADBE Vector Grad Start Pt"), ch.props && ch.props.Start);
+                        applyOneProp(gf.property("ADBE Vector Grad End Pt"),   ch.props && ch.props.End);
+                        try {
+                            var cols = gf.property("ADBE Vector Grad Colors");
+                            if (ch.props && ch.props.ColorsKF && ch.props.ColorsKF.length){
+                                try { for (var rk=cols.numKeys; rk>=1; rk--) cols.removeKey(rk); } catch(__){}
+                                var lastV = null;
+                                for (var kk=0; kk<ch.props.ColorsKF.length; kk++){
+                                    var kv = ch.props.ColorsKF[kk];
+                                    lastV = kv.v;
+                                    try { cols.setValueAtTime(kv.t, kv.v); } catch(e1){}
+                                }
+                                try { if (cols.numKeys===0 && lastV) cols.setValue(lastV); } catch(e2){}
+                            } else if (ch.props && ch.props.ColorsV && ch.props.ColorsV.length){
+                                try { cols.setValue(ch.props.ColorsV); } catch(e3){}
+                            }
+                        } catch(_){}
+                    }
+                }
+            }
+        }
+    } catch(e){}
+    applyTransformBlock(sh, layerData.transform);
+    return sh;
+}
+/* --- export shapes API to global (panel-safe) --- */
+try {
+    $.global.serializeShapeLayer     = serializeShapeLayer;
+    $.global.recreateShapeLayer      = recreateShapeLayer;
+
+    $.global.serializeShapeProp      = serializeShapeProp;
+    $.global.applyShapeProp          = applyShapeProp;
+
+    $.global.serializeVectorTransform= serializeVectorTransform;
+    $.global.applyVectorTransform    = applyVectorTransform;
+
+    $.global.applyColor              = applyColor;
+} catch(e){ /* no-op */ }
+/* --- end export --- */

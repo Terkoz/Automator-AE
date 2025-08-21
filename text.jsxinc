@@ -1,0 +1,420 @@
+﻿// text.jsxinc — Text export/import (TextDocument + Text Animators)
+// Minimal, robust, ES3-safe. Focus on correct Animator Selectors/Properties IO.
+
+// ---- bridge to $.global (panel-safe) ----
+if (typeof serializeOneProp === "undefined" && $.global && $.global.serializeOneProp) var serializeOneProp = $.global.serializeOneProp;
+if (typeof applyOneProp     === "undefined" && $.global && $.global.applyOneProp)     var applyOneProp     = $.global.applyOneProp;
+if (typeof safeNumber       === "undefined" && $.global && $.global.safeNumber)       var safeNumber       = $.global.safeNumber;
+if (typeof safeArray        === "undefined" && $.global && $.global.safeArray)        var safeArray        = $.global.safeArray;
+
+if (typeof getAnchorProperty   === "undefined" && $.global) var getAnchorProperty   = $.global.getAnchorProperty;
+if (typeof getPositionProperty === "undefined" && $.global) var getPositionProperty = $.global.getPositionProperty;
+if (typeof getScaleProperty    === "undefined" && $.global) var getScaleProperty    = $.global.getScaleProperty;
+if (typeof getRotationProperty === "undefined" && $.global) var getRotationProperty = $.global.getRotationProperty;
+if (typeof getOpacityProperty  === "undefined" && $.global) var getOpacityProperty  = $.global.getOpacityProperty;
+if (typeof applyTransformBlock === "undefined" && $.global) var applyTransformBlock = $.global.applyTransformBlock;
+
+// ---- tiny utils ----
+function _isGroupProp(p){
+    try { return (p && typeof p.property === "function" && typeof p.numProperties === "number"); }
+    catch(e){ return false; }
+}
+function _propByName(group, key){
+    var p = null;
+    try {
+        if (group && group.property) {
+            p = group.property(key);
+            if (p) return p;
+        }
+    } catch(e){}
+    try {
+        if (!group || typeof group.numProperties !== "number") return null;
+        var i, q;
+        for (i=1; i<=group.numProperties; i++){
+            q = group.property(i);
+            if (!q) continue;
+            try { if (q.matchName === key) return q; } catch(_m){}
+            try { if (q.name === key) return q; } catch(_n){}
+        }
+    } catch(e2){}
+    return null;
+}
+function __isArrayEq(a,b){
+    try {
+        if (!a || !b) return false;
+        if (a.length !== b.length) return false;
+        for (var i=0; i<a.length; i++){ if (a[i] !== b[i]) return false; }
+        return true;
+    } catch(__e){ return false; }
+}
+function __shouldKeepAnimatorProp(key, rec, layer){
+    if (!rec) return false;
+    try { if (rec.isKeyframed) return true; } catch(__eKF){}
+
+    // Skip large 3D text material blocks and noisy props we don't reconstruct
+    if (key && key.indexOf("ADBE 3DText ") === 0) return false;
+    var NOISY = {
+        "ADBE Text Side Opacity":1,
+        "ADBE Text Back Opacity":1,
+        "ADBE Text Line Anchor":1,
+        "ADBE Text Track Type":1,
+        "ADBE Text Character Change Type":1,
+        "ADBE Text Character Range":1,
+        "ADBE Text Character Replace":1,
+        "ADBE Text Character Offset":1,
+        "ADBE Text Line Spacing":1,
+        "ADBE Text Blur":1
+    };
+    if (NOISY[key]) return false;
+
+    // Respect base TextDocument toggles
+    if (key === "ADBE Text Fill Color" || key === "ADBE Text Fill Opacity"){
+        try { var tdF = layer.property("Source Text").value; if (!tdF || tdF.applyFill !== true) return false; } catch(__eF){}
+    }
+    if (key && key.indexOf("ADBE Text Stroke") === 0){
+        try { var tdS = layer.property("Source Text").value; if (!tdS || tdS.applyStroke !== true) return false; } catch(__eS){}
+    }
+
+    // Skip defaults when not keyframed
+    var DFLT = {
+        "ADBE Text Opacity":100,
+        "ADBE Text Fill Opacity":100,
+        "ADBE Text Stroke Opacity":100,
+        "ADBE Text Position 3D":[0,0,0],
+        "ADBE Text Anchor Point 3D":[0,0,0],
+        "ADBE Text Scale 3D":[100,100,100],
+        "ADBE Text Rotation":0,
+        "ADBE Text Rotation X":0,
+        "ADBE Text Rotation Y":0,
+        "ADBE Text Skew":0,
+        "ADBE Text Skew Axis":0,
+        "ADBE Text Tracking Amount":0
+    };
+    try {
+        if (rec.hasOwnProperty("value")){
+            var dv = DFLT[key];
+            if (typeof dv !== "undefined"){
+                if (dv && typeof dv.splice === "function"){
+                    if (__isArrayEq(rec.value, dv)) return false;
+                } else {
+                    if (rec.value === dv) return false;
+                }
+            }
+        }
+    } catch(__eCmp){}
+
+    return true;
+}
+function __ensureAnimProp(propsGrp, key){
+    if (!propsGrp || !key) return null;
+
+    var p = null;
+    try { p = _propByName(propsGrp, key); } catch(e0){ p = null; }
+    if (p) return p;
+
+    try { propsGrp.addProperty(key); } catch(e1){}
+    try { p = _propByName(propsGrp, key); } catch(e2){ p = null; }
+    if (p) return p;
+
+    // Soft aliases for picky builds
+    var ALIAS = [];
+    if (key === "ADBE Text Opacity")        ALIAS = ["ADBE Text Opacity", "ADBE Text Fill Opacity"];
+    else if (key === "ADBE Text Position 3D")ALIAS = ["ADBE Text Position 3D"];
+    else if (key === "ADBE Text Scale 3D")   ALIAS = ["ADBE Text Scale 3D"];
+    else if (key === "ADBE Text Anchor Point 3D") ALIAS = ["ADBE Text Anchor Point 3D"];
+    else if (key === "ADBE Text Rotation")   ALIAS = ["ADBE Text Rotation"];
+    else if (key === "ADBE Text Skew")       ALIAS = ["ADBE Text Skew"];
+    else if (key === "ADBE Text Skew Axis")  ALIAS = ["ADBE Text Skew Axis"];
+
+    for (var i=0; i<ALIAS.length; i++){
+        var aKey = ALIAS[i], q = null;
+        try { propsGrp.addProperty(aKey); } catch(eA){}
+        try { q = _propByName(propsGrp, aKey); } catch(eF){ q = null; }
+        if (q) return q;
+    }
+    return null;
+}
+
+// ---- serialize: Text Animators ----
+function serializeTextAnimators(layer){
+    var out = [];
+    var anims = null;
+
+    try { anims = layer.property("ADBE Text Animators"); } catch(e){ anims = null; }
+    if (!anims){
+        var textGrp = null;
+        try { textGrp = layer.property("ADBE Text Properties"); } catch(e1){}
+        if (!textGrp){ try { textGrp = layer.property("Text"); } catch(e2){} }
+        try { anims = textGrp ? textGrp.property("ADBE Text Animators") : null; } catch(e3){}
+    }
+    if (!anims) return out;
+
+    var KNOWN = [
+        "ADBE Text Opacity",
+        "ADBE Text Position 3D",
+        "ADBE Text Anchor Point 3D",
+        "ADBE Text Scale 3D",
+        "ADBE Text Rotation",
+        "ADBE Text Tracking Amount",
+        "ADBE Text Skew",
+        "ADBE Text Skew Axis",
+        "ADBE Text Fill Opacity",
+        "ADBE Text Fill Color",
+        "ADBE Text Stroke Color",
+        "ADBE Text Stroke Width",
+        "ADBE Text Stroke Over Fill"
+    ];
+
+    for (var i=1; i<=anims.numProperties; i++){
+        var an = anims.property(i);
+        if (!an) continue;
+
+        var anObj = { name: an.name, matchName: an.matchName, properties: {}, selectors: [] };
+
+        // Animator Properties
+        var propsGrp = null;
+        try { propsGrp = an.property("ADBE Text Animator Properties"); } catch(eP){ propsGrp = null; }
+        if (propsGrp){
+            for (var j=1; j<=propsGrp.numProperties; j++){
+                var p = propsGrp.property(j);
+                if (!p) continue;
+                if (_isGroupProp(p)) continue;
+                var key = p.matchName ? p.matchName : p.name;
+
+                if (key === "ADBE Text Stroke Color" || key === "ADBE Text Stroke Width" || key === "ADBE Text Stroke Over Fill"){
+                    if (!_hasBaseStroke(layer)) { /* skip */ } else {
+                        try { var __rec1 = serializeOneProp(p); if (__shouldKeepAnimatorProp(key, __rec1, layer)) anObj.properties[key] = __rec1; } catch(eS1){}
+                    }
+                } else if (key === "ADBE Text Fill Color"){
+                    if (!_hasBaseFill(layer)) { /* skip */ } else {
+                        try { var __rec2 = serializeOneProp(p); if (__shouldKeepAnimatorProp(key, __rec2, layer)) anObj.properties[key] = __rec2; } catch(eS2){}
+                    }
+                } else {
+                    try { var __rec3 = serializeOneProp(p); if (__shouldKeepAnimatorProp(key, __rec3, layer)) anObj.properties[key] = __rec3; } catch(eS3){}
+                }
+            }
+
+            // Known fallback pass
+            for (var kf=0; kf<KNOWN.length; kf++){
+                var kk = KNOWN[kf];
+                if (anObj.properties.hasOwnProperty(kk)) continue;
+                var pr = null;
+                try { pr = propsGrp.property(kk); } catch(eF){ pr = null; }
+                if (!pr) continue;
+                if (kk === "ADBE Text Stroke Color" || kk === "ADBE Text Stroke Width" || kk === "ADBE Text Stroke Over Fill"){
+                    if (!_hasBaseStroke(layer)) continue;
+                }
+                if (kk === "ADBE Text Fill Color"){
+                    if (!_hasBaseFill(layer)) continue;
+                }
+                try { var __recK = serializeOneProp(pr); if (__shouldKeepAnimatorProp(kk, __recK, layer)) anObj.properties[kk] = __recK; } catch(eK){}
+            }
+        }
+
+        // Selectors
+        var sels = null;
+        try { sels = an.property("ADBE Text Selectors"); } catch(eS){ sels = null; }
+        if (sels){
+            for (var s=1; s<=sels.numProperties; s++){
+                var sel = sels.property(s);
+                if (!sel) continue;
+                var selObj = { name: sel.name, matchName: sel.matchName, props: {}, advanced: {} };
+
+                // Range props with percent/index fallbacks
+                var pStart = _propByName(sel, "ADBE Text Range Start");
+                if (!pStart) pStart = _propByName(sel, "ADBE Text Percent Start");
+                if (!pStart) pStart = _propByName(sel, "ADBE Text Index Start");
+                if (!pStart) pStart = _propByName(sel, "Start");
+
+                var pEnd   = _propByName(sel, "ADBE Text Range End");
+                if (!pEnd)  pEnd = _propByName(sel, "ADBE Text Percent End");
+                if (!pEnd)  pEnd = _propByName(sel, "ADBE Text Index End");
+                if (!pEnd)  pEnd = _propByName(sel, "End");
+
+                var pOff   = _propByName(sel, "ADBE Text Range Offset");
+                if (!pOff)  pOff = _propByName(sel, "ADBE Text Percent Offset");
+                if (!pOff)  pOff = _propByName(sel, "ADBE Text Index Offset");
+                if (!pOff)  pOff = _propByName(sel, "Offset");
+
+                if (pStart) try { selObj.props.start  = serializeOneProp(pStart); } catch(eRS){}
+                if (pEnd)   try { selObj.props.end    = serializeOneProp(pEnd);   } catch(eRE){}
+                if (pOff)   try { selObj.props.offset = serializeOneProp(pOff);   } catch(eRO){}
+
+                // Advanced
+                var adv = _propByName(sel, "ADBE Text Range Advanced"); if (!adv) adv = _propByName(sel, "Advanced");
+                if (adv){
+                    for (var a=1; a<=adv.numProperties; a++){
+                        var ap = adv.property(a);
+                        if (!ap) continue;
+                        var ak = ap.matchName ? ap.matchName : ap.name;
+                        try { selObj.advanced[ak] = serializeOneProp(ap); } catch(eA1){}
+                    }
+                }
+
+                // Generic selector-level extras (e.g., Amount), excluding Range S/E/O and Advanced children
+                try {
+                    for (var ii = 1; ii <= sel.numProperties; ii++){
+                        var ip = sel.property(ii);
+                        if (!ip) continue;
+                        if (_isGroupProp(ip)) continue;
+                        var ik = ip.matchName ? ip.matchName : ip.name;
+                        if (ik === "ADBE Text Range Start" || ik === "ADBE Text Range End" || ik === "ADBE Text Range Offset") continue;
+                        var parent = null, isAdv = false;
+                        try { parent = ip.parentProperty; isAdv = (parent && (parent.matchName === "ADBE Text Range Advanced" || parent.name === "Advanced")); } catch(__eP){}
+                        if (isAdv) continue;
+                        if (!selObj.props[ik] && !selObj.advanced[ik]){
+                            try { selObj.props[ik] = serializeOneProp(ip); } catch(__eSer){}
+                        }
+                    }
+                } catch(__eSelExtras) {}
+
+                anObj.selectors.push(selObj);
+            }
+        }
+
+        out.push(anObj);
+    }
+
+    return out;
+}
+
+// ---- recreate: Text Animators ----
+function recreateTextAnimators(textLayer, animators){
+    if (!animators || !animators.length) return;
+
+    var anims = null, tg = null;
+    try { anims = textLayer.property("ADBE Text Animators"); } catch(e0){ anims = null; }
+    if (!anims){
+        try { tg = textLayer.property("ADBE Text Properties"); } catch(e1){ tg = null; }
+        if (!tg){ try { tg = textLayer.property("Text"); } catch(e2){ tg = null; } }
+        try { anims = tg ? tg.property("ADBE Text Animators") : null; } catch(e3){ anims = null; }
+    }
+    if (!anims) return;
+
+    for (var i = 0; i < animators.length; i++){
+        var src = animators[i];
+        var a = null;
+
+        // Create animator
+        try { a = anims.addProperty(src.matchName ? src.matchName : "ADBE Text Animator"); }
+        catch(eA){ try { a = anims.addProperty("ADBE Text Animator"); } catch(eA2){} }
+        if (!a) continue;
+        try { if (src.name) a.name = src.name; } catch(eN){}
+
+        // 1) SELECTORS first
+        var sels = null;
+        try { sels = a.property("ADBE Text Selectors"); } catch(eSS){ sels = null; }
+        if (sels && src.selectors && src.selectors.length){
+            for (var s = 0; s < src.selectors.length; s++){
+                var so = src.selectors[s];
+                var sel = null;
+                try { sel = sels.addProperty(so.matchName ? so.matchName : "ADBE Text Selector"); }
+                catch(eSel){ try { sel = sels.addProperty("ADBE Text Selector"); } catch(eSel2){} }
+                if (!sel) continue;
+                try { if (so.name) sel.name = so.name; } catch(eSN){}
+
+                // Range with percent/index fallbacks
+                if (so.props){
+                    var pStart = _propByName(sel, "ADBE Text Range Start");
+                    if (!pStart) pStart = _propByName(sel, "ADBE Text Percent Start");
+                    if (!pStart) pStart = _propByName(sel, "ADBE Text Index Start");
+                    if (!pStart) pStart = _propByName(sel, "Start");
+
+                    var pEnd   = _propByName(sel, "ADBE Text Range End");
+                    if (!pEnd)  pEnd = _propByName(sel, "ADBE Text Percent End");
+                    if (!pEnd)  pEnd = _propByName(sel, "ADBE Text Index End");
+                    if (!pEnd)  pEnd = _propByName(sel, "End");
+
+                    var pOff   = _propByName(sel, "ADBE Text Range Offset");
+                    if (!pOff)  pOff = _propByName(sel, "ADBE Text Percent Offset");
+                    if (!pOff)  pOff = _propByName(sel, "ADBE Text Index Offset");
+                    if (!pOff)  pOff = _propByName(sel, "Offset");
+
+                    try { if (pStart && so.props.start)  applyOneProp(pStart, so.props.start); } catch(eR1){}
+                    try { if (pEnd   && so.props.end)    applyOneProp(pEnd,   so.props.end);   } catch(eR2){}
+                    try { if (pOff   && so.props.offset) applyOneProp(pOff,   so.props.offset);} catch(eR3){}
+                }
+
+                // Advanced
+                var adv = _propByName(sel, "ADBE Text Range Advanced"); if (!adv) adv = _propByName(sel, "Advanced");
+                if (adv && so.advanced){
+                    for (var kk in so.advanced){
+                        if (!so.advanced.hasOwnProperty(kk)) continue;
+                        var ap = _propByName(adv, kk); if (!ap && kk) ap = _propByName(adv, String(kk));
+                        if (ap){
+                            try { applyOneProp(ap, so.advanced[kk]); } catch(eAk){}
+                        }
+                    }
+                }
+
+                // Generic selector-level extras (excluding S/E/O)
+                if (so.props){
+                    for (var k in so.props){
+                        if (!so.props.hasOwnProperty(k)) continue;
+                        if (k === "ADBE Text Range Start" || k === "ADBE Text Range End" || k === "ADBE Text Range Offset") continue;
+                        var gp = _propByName(sel, k); if (!gp && k) gp = _propByName(sel, String(k));
+                        if (gp){
+                            try { applyOneProp(gp, so.props[k]); } catch(eGp){}
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) PROPERTIES after selectors
+        var propsGrp = null;
+        try { propsGrp = a.property("ADBE Text Animator Properties"); } catch(ePG){ propsGrp = null; }
+        if (propsGrp && src.properties){
+            for (var pk in src.properties){
+                if (!src.properties.hasOwnProperty(pk)) continue;
+                var p = __ensureAnimProp(propsGrp, pk);
+                if (!p && pk) p = __ensureAnimProp(propsGrp, String(pk));
+                if (!p) continue;
+                try { applyOneProp(p, src.properties[pk]); } catch(eAP){}
+            }
+        }
+    }
+}
+
+// ---- Text-layer minimal API ----
+function serializeTextLayer(layer){
+    var o = { type: "TextLayer", name: layer.name };
+    // basic timing
+    try { o.inPoint = layer.inPoint; o.outPoint = layer.outPoint; } catch(e){}
+    try { o.threeD = !!layer.threeDLayer; } catch(e2){}
+    // TextDocument (snapshot if no keys)
+    try {
+        var tdProp = layer.property("ADBE Text Properties").property("ADBE Text Document");
+        if (tdProp && !tdProp.numKeys){
+            o.textDocument = tdProp.value;
+        } else if (tdProp && tdProp.numKeys){
+            // keys captured elsewhere in project if needed; keep simple here
+            o.textDocument = tdProp.value;
+        }
+    } catch(e3){}
+    // Animators
+    try { o.textAnimators = serializeTextAnimators(layer); } catch(e4){ o.textAnimators = []; }
+    return o;
+}
+
+function recreateTextLayer(comp, layerData){
+    var t = comp.layers.addText(layerData && layerData.name ? layerData.name : "Text");
+    try {
+        if (layerData && layerData.textDocument){
+            t.property("ADBE Text Properties").property("ADBE Text Document").setValue(layerData.textDocument);
+        }
+    } catch(e0){}
+    // transforms (if provided by core)
+    try { if (layerData && layerData.transform) applyTransformBlock(t, layerData.transform); } catch(eT){}
+    // animators
+    try { recreateTextAnimators(t, (layerData && layerData.textAnimators) ? layerData.textAnimators : []); } catch(eA){}
+    return t;
+}
+
+// ---- export API to $.global (panel-safe) ----
+try {
+    $.global.serializeTextLayer = serializeTextLayer;
+    $.global.recreateTextLayer  = recreateTextLayer;
+    $.global.serializeTextAnimators = serializeTextAnimators;
+    $.global.recreateTextAnimators  = recreateTextAnimators;
+} catch(e){}
